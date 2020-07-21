@@ -5,6 +5,9 @@ import numpy as np
 import platform
 import pickle
 from flask import Flask, render_template, Response
+import nanocamera as nano
+import dlib
+print(dlib.DLIB_USE_CUDA)
 
 # Flask initialize
 app = Flask(__name__)
@@ -44,6 +47,59 @@ def running_on_jetson_nano():
     return platform.machine() == "aarch64"
 
 
+def open_cam_rtsp(uri, width, height, latency):
+    gst_str = ('rtspsrc location={} latency={} ! '
+               'rtph264depay ! h264parse ! omxh264dec ! '
+               'nvvidconv ! '
+               'video/x-raw, width=(int){}, height=(int){}, '
+               'format=(string)BGRx ! '
+               'videoconvert ! appsink').format(uri, latency, width, height)
+    return cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
+
+def open_cam_usb(dev, width, height):
+    # We want to set width and height here, otherwise we could just do:
+    #     return cv2.VideoCapture(dev)
+    #gst_str = ('v4l2src device=/dev/video{} ! '
+    #           'video/x-raw, width=(int){}, height=(int){} ! '
+    #           'videoconvert ! appsink').format(dev, width, height)
+    #gst_str = ('v4l2src device=/dev/video{} ! '
+    #           'image/jpeg, width=(int){}, height=(int){}, framerate=30/1 ! jpegparse ! '
+    #           'nvjpegdec ! video/x-raw, format=(string)I420 ! nvvidconv ! '
+    #           'video/x-raw, format=(string)RGBA ! nvvidconv ! video/x-raw, format=(string)RGBA ! appsink').format(dev, width, height)
+    gst_str = ('v4l2src device=/dev/video{} ! video/x-raw, width=(int){}, height=(int){} ! ' 
+               'nvvidconv ! video/x-raw(memory:NVMM), format=(string)I420, width=(int){}, height=(int){} ! '
+               'nvvidconv ! video/x-raw, width=(int){}, height=(int){}, format=(string)BGRx ! '
+               'videoconvert ! tee ! appsink').format(dev, width, height, width, height, width, height)
+#'video/x-raw(memory:NVMM), width=(int){}, height=(int){}, format=UYVY ! '
+#               'nvvidconv ! video/x-raw, width=(int){}, height=(int){}, framerate=(fraction)60/1 ! videoconvert ! appsink').format(dev, width, height, width, height)
+
+    return cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
+
+def open_cam_onboard(width, height):
+    gst_elements = str(subprocess.check_output('gst-inspect-1.0'))
+    if 'nvcamerasrc' in gst_elements:
+        # On versions of L4T prior to 28.1, add 'flip-method=2' into gst_str
+        gst_str = ('nvcamerasrc ! '
+                   'video/x-raw(memory:NVMM), '
+                   'width=(int)2592, height=(int)1458, '
+                   'format=(string)I420, framerate=(fraction)30/1 ! '
+                   'nvvidconv ! '
+                   'video/x-raw, width=(int){}, height=(int){}, '
+                   'format=(string)BGRx ! '
+                   'videoconvert ! appsink').format(width, height)
+    elif 'nvarguscamerasrc' in gst_elements:
+        gst_str = ('nvarguscamerasrc ! '
+                   'video/x-raw(memory:NVMM), '
+                   'width=(int)1920, height=(int)1080, '
+                   'format=(string)NV12, framerate=(fraction)30/1 ! '
+                   'nvvidconv flip-method=2 ! '
+                   'video/x-raw, width=(int){}, height=(int){}, '
+                   'format=(string)BGRx ! '
+                   'videoconvert ! appsink').format(width, height)
+    else:
+        raise RuntimeError('onboard camera source not found!')
+    return cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
+
 def get_jetson_gstreamer_source(RTSP_ADDR, capture_width=1280, capture_height=720, display_width=1280, display_height=720, framerate=25, flip_method=0):
     """
     Return an OpenCV-compatible video source description that uses gstreamer to capture video from the camera on a Jetson Nano
@@ -63,12 +119,12 @@ def get_jetson_gstreamer_source(RTSP_ADDR, capture_width=1280, capture_height=72
             # video/x-raw, format=RGB ! videoconvert !";
             #"appsink name=mysink";
     
-            #---- RTSP works confirmed1 ----
-            'rtspsrc location={} latency=500 ! '.format(RTSP_ADDR) +
-            'rtph264depay ! h264parse ! ' + 
-            'omxh264dec disable-dvfs=1 ! videoconvert ! ' +
-            'appsink'
-            #------------------------------
+            ##---- RTSP works confirmed1 ----
+            #'rtspsrc location={} latency=500 ! '.format(RTSP_ADDR) +
+            #'rtph264depay ! h264parse ! ' + 
+            #'omxh264dec disable-dvfs=1 ! videoconvert ! ' +
+            #'appsink'
+            ##------------------------------
             
             ###---- RTSP works with nvv4l2decoder ----
             ##'rtspsrc location={} latency=500 ! '.format(RTSP_ADDR) +
@@ -142,35 +198,38 @@ def lookup_known_face(face_encoding):
 
 def threadVid():
     # Get access to the webcam. The method is different depending on if this is running on a laptop or a Jetson Nano.
-    if running_on_jetson_nano():
-        RTSP_ADDR = 'rtsp://admin:intflow3121@192.168.0.100:554/cam/realmonitor?channel=1&subtype=0'
-        # Accessing the camera with OpenCV on a Jetson Nano requires gstreamer with a custom gstreamer source string
-        print(get_jetson_gstreamer_source(RTSP_ADDR))
-        video_capture = cv2.VideoCapture(get_jetson_gstreamer_source(RTSP_ADDR), cv2.CAP_GSTREAMER)
-    else:
-        # Accessing the camera with OpenCV on a laptop just requires passing in the number of the webcam (usually 0)
-        # Note: You can pass in a filename instead if you want to process a video file instead of a live camera stream
-        video_capture = cv2.VideoCapture(0)
+    #if running_on_jetson_nano():
+    #    #RTSP_ADDR = 'rtsp://admin:intflow3121@192.168.0.100:554/cam/realmonitor?channel=1&subtype=0'
+    #    # Accessing the camera with OpenCV on a Jetson Nano requires gstreamer with a custom gstreamer source string
+    #    #print(get_jetson_gstreamer_source(RTSP_ADDR))
+    #    #video_capture = cv2.VideoCapture(get_jetson_gstreamer_source(0), cv2.CAP_GSTREAMER)
+    #    video_capture = open_cam_usb(1, 320, 240)
+    #else:
+    #    # Accessing the camera with OpenCV on a laptop just requires passing in the number of the webcam (usually 0)
+    #    # Note: You can pass in a filename instead if you want to process a video file instead of a live camera stream
+    #    video_capture = cv2.VideoCapture(0)
 
-    video_capture = cv2.VideoCapture(RTSP_ADDR)
+    #video_capture = cv2.VideoCapture(RTSP_ADDR)
+    #video_capture = cv2.VideoCapture(0)
     #video_capture = cv2.VideoCapture("rtsp://admin:intflow3121@192.168.0.100:554/cam/realmonitor?channel=1&subtype=0")
     #video_capture_thermal = cv2.VideoCapture("rtsp://admin:intflow3121@192.168.0.100:554/cam/realmonitor?channel=2&subtype=0")
+    video_capture = nano.Camera(camera_type=1, device_id=0, width=640, height=480, fps=30, enforce_fps=True)
 
     # Track how long since we last saved a copy of our known faces to disk as a backup.
     number_of_faces_since_save = 0
 
-    while True:
+    while video_capture.isReady():
         # Grab a single frame of video
-        ret, frame = video_capture.read()
+        frame = video_capture.read()
         #ret_thermal, frame_thermal = video_capture_thermal.read()
 
-        video_capture.grab()
+        #video_capture.grab()
         #video_capture_thermal.grab()
 
-        if ret == 0:# or ret_thermal == 0:
-            continue
+        #if ret == 0:# or ret_thermal == 0:
+        #    continue
 
-        frame = cv2.resize(frame, (640, 480))
+        #frame = cv2.resize(frame, (640, 480))
         #frame_thermal = cv2.resize(frame_thermal, (480, 640))
 
         # Resize frame of video to 1/4 size for faster face recognition processing
@@ -180,7 +239,7 @@ def threadVid():
         rgb_small_frame = small_frame[:, :, ::-1]
 
         # Find all the face locations and face encodings in the current frame of video
-        face_locations = face_recognition.face_locations(rgb_small_frame)
+        face_locations = face_recognition.face_locations(rgb_small_frame, model='cnn')
         face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
         # Loop through each detected face and see if it is one we have seen before
